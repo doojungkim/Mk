@@ -1,18 +1,16 @@
 import streamlit as st
-import feedparser
 import requests
 from bs4 import BeautifulSoup
 from deep_translator import GoogleTranslator
 import re
 from html import unescape
-from collections import Counter
 
 st.set_page_config(page_title="MK Daily English", page_icon="📰", layout="centered")
 
 st.title("📰 MK Daily English")
-st.caption("매일경제 TOP 5 · 기사당 핵심 영어 문장 1개 + 구조 분석")
+st.caption("매일경제 인기뉴스 TOP 5 · 최근 2시간 조회수 기준 · 뉴스 종합")
 
-RSS_URL = "https://www.mk.co.kr/rss/30000001/"
+RANKING_URL = "https://www.mk.co.kr/news/ranking"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36"
 }
@@ -43,13 +41,54 @@ def is_noise(text):
 
 @st.cache_data(ttl=600)
 def load_news():
-    feed = feedparser.parse(RSS_URL)
-    return [{
-        "title": clean(entry.get("title", "제목 없음")),
-        "summary": clean(entry.get("summary") or entry.get("description") or ""),
-        "link": entry.get("link", ""),
-        "published": entry.get("published", "")
-    } for entry in feed.entries[:5]]
+    """Official MK Popular News page, default '뉴스 종합' tab, top 5."""
+    try:
+        r = requests.get(RANKING_URL, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        items = []
+        seen = set()
+
+        # The official ranking page exposes anchors whose text starts with
+        # 1, 2, 3... for the default '뉴스 종합' ranking.
+        for a in soup.find_all("a", href=True):
+            title = clean(a.get_text(" ", strip=True))
+            m = re.match(r"^(\\d+)\\s+(.+)$", title)
+            if not m:
+                continue
+
+            rank = int(m.group(1))
+            article_title = m.group(2).strip()
+            href = a.get("href", "").strip()
+
+            if rank > 5 or not article_title or not href:
+                continue
+            if not href.startswith("http"):
+                href = "https://www.mk.co.kr" + href
+
+            key = (rank, href)
+            if key in seen:
+                continue
+
+            seen.add(key)
+            items.append({
+                "rank": rank,
+                "title": article_title,
+                "summary": "",
+                "link": href,
+                "published": ""
+            })
+
+        # Keep exactly ranks 1-5 in order.
+        by_rank = {}
+        for item in items:
+            by_rank.setdefault(item["rank"], item)
+
+        result = [by_rank[i] for i in range(1, 6) if i in by_rank]
+        return result
+    except Exception:
+        return []
 
 @st.cache_data(ttl=1800)
 def get_article_paragraphs(url):
@@ -99,84 +138,69 @@ def split_sentences(text):
     parts = re.split(r'(?<=[.!?。！？])\s+|(?<=[다요죠음함임됨])\s+', text)
     return [p.strip() for p in parts if len(p.strip()) >= 30 and not is_noise(p)]
 
-def sentence_score(sentence, all_text, index):
-    words = re.findall(r"[가-힣A-Za-z]{2,}", sentence.lower())
-    freq = Counter(re.findall(r"[가-힣A-Za-z]{2,}", all_text.lower()))
-
-    stop = {
-        "그리고","그러나","이번","관련","대해","있는","있다","했다","하는",
-        "것으로","대한","통해","위해","따라","에서","으로","이라고","했다며",
-        "밝혔다","전했다","있는","것","수","등","및","또한","the","and","for",
-        "with","that","this","from","have","has","were","will","into","about"
-    }
-    score = sum(freq[w] for w in words if w not in stop)
-
-    # News leads are useful, but don't let the first sentence dominate.
-    score += max(0, 8 - index) * 1.2
-
-    # Prefer substantive sentences and penalize captions/quotes that are too short.
-    if 50 <= len(sentence) <= 350:
-        score += 10
-    elif len(sentence) > 500:
-        score -= 4
-    if sentence.startswith(("연합뉴스", "정부", "업계")):
-        score += 1
-    return score
-
 @st.cache_data(ttl=3600)
-def make_english_summary(paragraphs, fallback):
+def translate_article_to_english(paragraphs, fallback):
+    """Translate about 10 substantive Korean sentences from the article."""
     source = " ".join(paragraphs) if paragraphs else fallback
     sentences = split_sentences(source)
 
+    # Remove repeated/metadata-like sentences and keep the article's flow.
+    selected = []
+    seen = set()
+    for s in sentences:
+        s = clean(s)
+        if is_noise(s):
+            continue
+        key = re.sub(r"\\s+", " ", s)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        # Skip very short fragments/headline-like material.
+        if len(s) < 35:
+            continue
+
+        selected.append(s)
+        if len(selected) >= 10:
+            break
+
+    translated = []
+    for s in selected:
+        try:
+            en = GoogleTranslator(source="ko", target="en").translate(s).strip()
+            if en:
+                translated.append(en)
+        except Exception:
+            continue
+
+    return translated
+
+
+def choose_difficult_sentence(sentences):
+    """Choose one teachable sentence from the translated 10 sentences."""
     if not sentences:
         return ""
 
-    # Pick exactly ONE useful and slightly challenging sentence from the article.
-    # Prefer sentences containing structures that are valuable for English study.
-    scored = []
-    teachable_patterns = [
+    patterns = [
         r"\\bwhich\\b", r"\\bthat\\b", r"\\bwhile\\b",
-        r"\\bbecause\\b", r"\\balthough\\b", r"\\bdespite\\b",
-        r"\\baccording to\\b", r"\\bby\\b", r"\\bto\\s+\\w+",
-        r"\\b(has|have|had)\\b.*\\b(been|\\w+ed)\\b"
+        r"\\balthough\\b", r"\\bdespite\\b", r"\\bbecause\\b",
+        r"\\baccording to\\b", r"\\bwhile\\b",
+        r"\\b(has|have|had)\\b", r"\\b(be|is|are|was|were)\\b.*\\bby\\b",
+        r"\\bto\\s+\\w+"
     ]
 
+    scored = []
     for i, s in enumerate(sentences):
-        if is_noise(s) or len(s) < 50:
-            continue
-
-        score = 0
-        score += min(len(s) / 80, 4)  # Prefer sentences with enough substance.
-        score += max(0, 5 - i) * 0.6  # Leads are often important.
-        score += sum(bool(re.search(p, s, re.I)) for p in teachable_patterns) * 3
-
-        # Avoid sentences that are mostly numbers, names, or very short headlines.
-        alpha = len(re.findall(r"[가-힣]", s))
-        digits = len(re.findall(r"\\d", s))
-        if digits > alpha:
-            score -= 2
-
+        score = min(len(s) / 45, 8)
+        score += sum(bool(re.search(p, s, re.I)) for p in patterns) * 3
+        # Slight preference for sentences in the middle of the article,
+        # avoiding the very first headline-like sentence.
+        if i == 0:
+            score -= 1
         scored.append((score, s))
 
-    if not scored:
-        scored = [(1, sentences[0])]
+    return max(scored, key=lambda x: x[0])[1]
 
-    korean_sentence = max(scored, key=lambda x: x[0])[1]
-
-    try:
-        return GoogleTranslator(source="ko", target="en").translate(korean_sentence).strip()
-    except Exception:
-        return ""
-
-
-@st.cache_data(ttl=3600)
-def translate_to_korean(text):
-    if not text:
-        return ""
-    try:
-        return GoogleTranslator(source="en", target="ko").translate(text)
-    except Exception:
-        return ""
 
 def explain_structure(sentence):
     s = sentence.strip()
@@ -216,7 +240,7 @@ if not news:
     st.error("매일경제 뉴스를 가져오지 못했습니다.")
     st.stop()
 
-st.success("매일경제 일반 뉴스 최신 TOP 5")
+st.success("매일경제 인기뉴스 TOP 5를 가져왔습니다.")
 
 for i, item in enumerate(news, 1):
     st.markdown(f"## 🏆 TOP {i}")
@@ -229,36 +253,40 @@ for i, item in enumerate(news, 1):
         st.link_button("🇰🇷 매일경제 원문 보기", item["link"])
 
     paragraphs = get_article_paragraphs(item["link"])
-    english_summary = make_english_summary(paragraphs, item["summary"])
+    english_sentences = translate_article_to_english(paragraphs, item["summary"])
 
-    st.markdown("#### 🇺🇸 오늘의 핵심 영어 문장")
+    st.markdown("#### 🇺🇸 Article in English")
 
-    if english_summary:
-        st.markdown(f"**{english_summary}**")
+    if english_sentences:
+        for n, sentence in enumerate(english_sentences, 1):
+            st.markdown(f"**{n}.** {sentence}")
 
-        korean = translate_to_korean(english_summary)
-        if korean:
-            st.markdown(f"**뜻:** {korean}")
+        learning = choose_difficult_sentence(english_sentences)
 
-        st.markdown("#### 📚 문장 구조 분석")
-        for explanation in explain_structure(english_summary):
-            st.markdown(f"- {explanation}")
+        if learning:
+            st.markdown("#### 📚 One Sentence to Study")
+            st.markdown(f"**{learning}**")
 
-        st.markdown("**읽는 방법:**")
-        chunks = re.split(
-            r"\s+(?=(?:which|that|while|because|although|despite|according to|to)\b)",
-            english_summary,
-            flags=re.I
-        )
-        if len(chunks) > 1:
-            st.write(" → ".join(chunks))
-        else:
-            st.write("문장의 핵심 주어와 동사를 먼저 찾고, 나머지 수식어를 붙여 읽어보세요.")
+            st.markdown("**Structure Analysis**")
+            for explanation in explain_structure(learning):
+                st.markdown(f"- {explanation}")
+
+            st.markdown("**How to read it:**")
+            chunks = re.split(
+                r"\\s+(?=(?:which|that|while|because|although|despite|according to|to)\\b)",
+                learning,
+                flags=re.I
+            )
+            if len(chunks) > 1:
+                st.write(" → ".join(chunks))
+            else:
+                st.write("Find the main subject and verb first, then attach the modifiers.")
+
     else:
-        st.caption("이번 기사에서 학습할 영어 문장을 가져오지 못했습니다.")
+        st.caption("기사 본문을 가져오지 못했습니다.")
 
     if i < len(news):
         st.divider()
 
 st.divider()
-st.caption("기사당 영어 문장 1개만 제공합니다 · OpenAI API 미사용 · 사진/포토 캡션 등 비본문 자료는 제외합니다.")
+st.caption("기사 본문 약 10문장 영어 번역 · 그중 1문장만 구조 분석 · OpenAI API 미사용 · 사진/포토 캡션 제외")
