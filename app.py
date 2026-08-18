@@ -50,22 +50,30 @@ def load_news():
         items = []
         seen = set()
 
-        # The official ranking page exposes anchors whose text starts with
-        # 1, 2, 3... for the default '뉴스 종합' ranking.
+        # Official ranking page: default "뉴스 종합" tab.
+        # The page currently renders ranked article links as:
+        # 1 title, 2 title, ... 30 title.
         for a in soup.find_all("a", href=True):
             title = clean(a.get_text(" ", strip=True))
-            m = re.match(r"^(\\d+)\\s+(.+)$", title)
+            m = re.match(r"^(\d+)\s+(.+)$", title)
             if not m:
                 continue
 
             rank = int(m.group(1))
+            if not 1 <= rank <= 5:
+                continue
+
             article_title = m.group(2).strip()
             href = a.get("href", "").strip()
-
-            if rank > 5 or not article_title or not href:
+            if not article_title or not href:
                 continue
-            if not href.startswith("http"):
+
+            if href.startswith("//"):
+                href = "https:" + href
+            elif href.startswith("/"):
                 href = "https://www.mk.co.kr" + href
+            elif not href.startswith("http"):
+                continue
 
             key = (rank, href)
             if key in seen:
@@ -112,8 +120,14 @@ def get_article_paragraphs(url):
         for selector in selectors:
             node = soup.select_one(selector)
             if node:
-                paragraphs = [clean(p.get_text(" ", strip=True))
-                              for p in node.find_all(["p", "div"])]
+                # Prefer actual paragraph tags. If the site uses divs for body
+                # text, fall back to direct text blocks.
+                ps = node.find_all("p")
+                if ps:
+                    paragraphs = [clean(p.get_text(" ", strip=True)) for p in ps]
+                else:
+                    paragraphs = [clean(x.get_text(" ", strip=True))
+                                  for x in node.find_all("div")]
                 paragraphs = [p for p in paragraphs if not is_noise(p)]
                 if paragraphs:
                     break
@@ -151,7 +165,7 @@ def translate_article_to_english(paragraphs, fallback):
         s = clean(s)
         if is_noise(s):
             continue
-        key = re.sub(r"\\s+", " ", s)
+        key = re.sub(r"\s+", " ", s)
         if key in seen:
             continue
         seen.add(key)
